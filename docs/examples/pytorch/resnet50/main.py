@@ -3,7 +3,10 @@ import os
 import shutil
 import time
 import math
+import queue
+import random
 
+import numpy as np
 import torch
 from torch.autograd import Variable
 import torch.nn as nn
@@ -15,6 +18,10 @@ import torch.utils.data
 import torch.utils.data.distributed
 import torchvision.models as models
 
+try:
+    import mc
+except ImportError:
+    raise ImportError("Please copy mc.so from /mnt/lustre/share/pymc/py3")
 
 try:
     from nvidia.dali.plugin.pytorch import DALIClassificationIterator
@@ -78,10 +85,157 @@ parser.add_argument("--local_rank", default=0, type=int)
 
 cudnn.benchmark = True
 
+
+class MemcachedInputIterator(object):
+    def __init__(self, batch_size, list_file, data_dir, num_shards, shard_id, random_shuffle):
+        server_list_config_file = "/mnt/lustre/share/memcached_client/server_list.conf"
+        client_config_file = "/mnt/lustre/share/memcached_client/client.conf"
+        self.mclient = mc.MemcachedClient.GetInstance(server_list_config_file, client_config_file)
+        self.batch_size = batch_size
+        self.num_shareds = num_shards
+        self.shard_id = shard_id
+        self.random_shuffle = random_shuffle
+        self.file_list = []
+        self.label_list = []
+        with open(list_file) as fin:
+            for line in fin:
+                filename, label = line.strip().split('\t')
+                filename = os.path.join(data_dir, filename)
+                label = int(label)
+                self.file_list.append(filename)
+                self.label_list.append(label)
+        self.index_queue = queue.Queue()
+        self.shard_size = None
+        self.shard_indexes = None
+        self.setup_shard()
+        self.warmup_cache()
+
+    def setup_shard(self):
+        shard_size = len(self.file_list) // self.num_shareds
+        # [start, end)
+        shard_start = shard_size * self.shard_id
+        shard_end = len(self.file_list) if self.shard_id == self.num_shareds - 1 else shard_size * (self.shard_id + 1)
+        shard_indexes = list(range(shard_start, shard_end))
+        self.shard_size = shard_size
+        self.shard_indexes = shard_indexes
+
+    def warmup_cache(self):
+        for ind in self.shard_indexes:
+            filename = self.file_list[ind]
+            value = mc.pyvector()
+            self.mclient.Get(filename, value)
+
+    def get_index(self):
+        if self.index_queue.empty():
+            if self.random_shuffle:
+                random.shuffle(self.shard_indexes)
+            # keep all shards of the same size
+            for ind in self.shard_indexes[:self.shard_size]:
+                self.index_queue.put(ind)
+        return self.index_queue.get()
+
+    def epoch_size(self):
+        return len(self.file_list) // self.num_shareds
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        jpegs = []
+        labels = []
+        for _ in range(self.batch_size):
+            ind = self.get_index()
+            filename = self.file_list[ind]
+            label = self.label_list[ind]
+
+            value = mc.pyvector()
+            self.mclient.Get(filename, value)
+            #ConvertBuffer函数为value创建memoryview对象，用于numpy解析array
+            value_buf = mc.ConvertBuffer(value)
+            # DO NOT reuse the buffer
+            jpegs.append(np.frombuffer(value_buf, dtype=np.uint8).copy())
+            labels.append(np.array([label], dtype=np.int32))
+        return jpegs, labels
+
+    next = __next__
+
+
+class CachedInputIterator(object):
+    def __init__(self, batch_size, list_file, data_dir, num_shards, shard_id, random_shuffle):
+        self.batch_size = batch_size
+        self.num_shareds = num_shards
+        self.shard_id = shard_id
+        self.random_shuffle = random_shuffle
+        self.file_list = []
+        self.cache_dict = dict()
+        self.label_list = []
+        with open(list_file) as fin:
+            for line in fin:
+                filename, label = line.strip().split('\t')
+                filename = os.path.join(data_dir, filename)
+                label = int(label)
+                self.file_list.append(filename)
+                self.label_list.append(label)
+        self.index_queue = queue.Queue()
+        self.shard_size = None
+        self.shard_indexes = None
+        self.setup_shard()
+        self.warmup_cache()
+
+    def setup_shard(self):
+        shard_size = len(self.file_list) // self.num_shareds
+        # [start, end)
+        shard_start = shard_size * self.shard_id
+        shard_end = len(self.file_list) if self.shard_id == self.num_shareds - 1 else shard_size * (self.shard_id + 1)
+        shard_indexes = list(range(shard_start, shard_end))
+        self.shard_size = shard_size
+        self.shard_indexes = shard_indexes
+
+    def warmup_cache(self):
+        for ind in self.shard_indexes:
+            filename = self.file_list[ind]
+            with open(filename, "rb") as fin:
+                self.cache_dict[filename] = fin.read()
+
+    def get_index(self):
+        if self.index_queue.empty():
+            if self.random_shuffle:
+                random.shuffle(self.shard_indexes)
+            # keep all shards of the same size
+            for ind in self.shard_indexes[:self.shard_size]:
+                self.index_queue.put(ind)
+        return self.index_queue.get()
+
+    def epoch_size(self):
+        return len(self.file_list) // self.num_shareds
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        jpegs = []
+        labels = []
+        for _ in range(self.batch_size):
+            ind = self.get_index()
+            filename = self.file_list[ind]
+            label = self.label_list[ind]
+
+            value = self.cache_dict[filename]
+            # DO NOT reuse the buffer
+            jpegs.append(np.frombuffer(value, dtype=np.uint8))
+            labels.append(np.array([label], dtype=np.int32))
+        return jpegs, labels
+
+    next = __next__
+
+
 class HybridTrainPipe(Pipeline):
-    def __init__(self, batch_size, num_threads, device_id, data_dir, crop, dali_cpu=False):
-        super(HybridTrainPipe, self).__init__(batch_size, num_threads, device_id, seed=12 + device_id)
-        self.input = ops.FileReader(file_root=data_dir, shard_id=args.local_rank, num_shards=args.world_size, random_shuffle=True)
+    def __init__(self, batch_size, num_threads, device_id, list_file, data_dir, crop, dali_cpu=False):
+        super(HybridTrainPipe, self).__init__(batch_size, num_threads, device_id, seed=12 + device_id, prefetch_queue_depth=10)
+        self.input = ops.ExternalSource()
+        self.input_label = ops.ExternalSource()
+        self.iterator = CachedInputIterator(batch_size, list_file=list_file, data_dir=data_dir, shard_id=args.local_rank, num_shards=args.world_size, random_shuffle=True)
+        # self.input = ops.FileReader(file_root=data_dir, shard_id=args.local_rank, num_shards=args.world_size, random_shuffle=True)
         #let user decide which pipeline works him bets for RN version he runs
         dali_device = 'cpu' if dali_cpu else 'gpu'
         decoder_device = 'cpu' if dali_cpu else 'mixed'
@@ -108,16 +262,28 @@ class HybridTrainPipe(Pipeline):
 
     def define_graph(self):
         rng = self.coin()
-        self.jpegs, self.labels = self.input(name="Reader")
+        self.jpegs = self.input()
+        self.labels = self.input_label()
         images = self.decode(self.jpegs)
         images = self.res(images)
         output = self.cmnp(images.gpu(), mirror=rng)
         return [output, self.labels]
 
+    def iter_setup(self):
+        images, labels = self.iterator.next()
+        self.feed_input(self.jpegs, images)
+        self.feed_input(self.labels, labels)
+
+    def epoch_size(self):
+        return self.iterator.epoch_size()
+
+
 class HybridValPipe(Pipeline):
-    def __init__(self, batch_size, num_threads, device_id, data_dir, crop, size):
+    def __init__(self, batch_size, num_threads, device_id, list_file, data_dir, crop, size):
         super(HybridValPipe, self).__init__(batch_size, num_threads, device_id, seed=12 + device_id)
-        self.input = ops.FileReader(file_root=data_dir, shard_id=args.local_rank, num_shards=args.world_size, random_shuffle=False)
+        self.input = ops.ExternalSource()
+        self.input_label = ops.ExternalSource()
+        self.iterator = CachedInputIterator(batch_size, list_file=list_file, data_dir=data_dir, shard_id=args.local_rank, num_shards=args.world_size, random_shuffle=False)
         self.decode = ops.ImageDecoder(device="mixed", output_type=types.RGB)
         self.res = ops.Resize(device="gpu", resize_shorter=size, interp_type=types.INTERP_TRIANGULAR)
         self.cmnp = ops.CropMirrorNormalize(device="gpu",
@@ -129,11 +295,70 @@ class HybridValPipe(Pipeline):
                                             std=[0.229 * 255,0.224 * 255,0.225 * 255])
 
     def define_graph(self):
-        self.jpegs, self.labels = self.input(name="Reader")
+        self.jpegs = self.input()
+        self.labels = self.input_label()
         images = self.decode(self.jpegs)
         images = self.res(images)
         output = self.cmnp(images)
         return [output, self.labels]
+
+    def iter_setup(self):
+        images, labels = self.iterator.next()
+        self.feed_input(self.jpegs, images)
+        self.feed_input(self.labels, labels)
+
+    def epoch_size(self):
+        return self.iterator.epoch_size()
+
+# class HybridTrainPipe(Pipeline):
+#     def __init__(self, batch_size, num_threads, device_id, data_dir):
+#         super(HybridTrainPipe, self).__init__(batch_size, num_threads, device_id, seed = 12 + device_id)
+#         self.input = ops.MXNetReader(path = [os.path.join(data_dir, "val.rec")], index_path=[os.path.join(data_dir, "val.idx")],
+#                                      random_shuffle = False, shard_id = device_id, num_shards = int(os.environ["WORLD_SIZE"]))
+#         self.decode = ops.ImageDecoderRandomCrop(device = "mixed",
+#                                                   output_type = types.RGB,
+#                                                   random_aspect_ratio = [0.8, 1.25],
+#                                                   random_area = [0.1, 1.0],
+#                                                   num_attempts = 100)
+#         self.resize = ops.Resize(device = "gpu", resize_x = 224, resize_y = 224)
+#         self.cmnp = ops.CropMirrorNormalize(device = "gpu",
+#                                             output_dtype = types.FLOAT,
+#                                             output_layout = types.NCHW,
+#                                             crop = (224, 224),
+#                                             image_type = types.RGB,
+#                                             mean = [0.485 * 255,0.456 * 255,0.406 * 255],
+#                                             std = [0.229 * 255,0.224 * 255,0.225 * 255])
+#         self.coin = ops.CoinFlip(probability = 0.5)
+
+#     def define_graph(self):
+#         rng = self.coin()
+#         self.jpegs, self.labels = self.input(name = "Reader")
+#         images = self.decode(self.jpegs)
+#         images = self.resize(images)
+#         output = self.cmnp(images, mirror = rng)
+#         return [output, self.labels]
+
+# class HybridValPipe(Pipeline):
+#     def __init__(self, batch_size, num_threads, device_id, data_dir):
+#         super(HybridValPipe, self).__init__(batch_size, num_threads, device_id, seed = 12 + device_id)
+#         self.input = ops.MXNetReader(path = [os.path.join(data_dir, "val.rec")], index_path=[os.path.join(data_dir, "val.idx")],
+#                                      random_shuffle = False, shard_id = device_id, num_shards = int(os.environ["WORLD_SIZE"]))
+#         self.decode = ops.ImageDecoder(device = "mixed", output_type = types.RGB)
+#         self.resize = ops.Resize(device = "gpu", resize_x = 256, resize_y = 256)
+#         self.cmnp = ops.CropMirrorNormalize(device = "gpu",
+#                                             output_dtype = types.FLOAT,
+#                                             output_layout = types.NCHW,
+#                                             crop = (224, 224),
+#                                             image_type = types.RGB,
+#                                             mean = [0.485 * 255,0.456 * 255,0.406 * 255],
+#                                             std = [0.229 * 255,0.224 * 255,0.225 * 255])
+
+#     def define_graph(self):
+#         self.jpegs, self.labels = self.input(name = "Reader")
+#         images = self.decode(self.jpegs)
+#         images = self.resize(images)
+#         output = self.cmnp(images)
+#         return [output, self.labels]
 
 best_prec1 = 0
 args = parser.parse_args()
@@ -159,11 +384,12 @@ if 'WORLD_SIZE' in os.environ:
 
 # make apex optional
 if args.fp16 or args.distributed:
-    try:
-        from apex.parallel import DistributedDataParallel as DDP
-        from apex.fp16_utils import *
-    except ImportError:
-        raise ImportError("Please install apex from https://www.github.com/nvidia/apex to run this example.")
+    # try:
+    #     from apex.parallel import DistributedDataParallel as DDP
+    #     from apex.fp16_utils import *
+    # except ImportError:
+    #     raise ImportError("Please install apex from https://www.github.com/nvidia/apex to run this example.")
+    from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 
 # item() is a recent addition, so this helps with backward compatibility.
 def to_python_float(t):
@@ -208,7 +434,8 @@ def main():
     if args.distributed:
         # shared param/delay all reduce turns off bucketing in DDP, for lower latency runs this can improve perf
         # for the older version of APEX please use shared_param, for newer one it is delay_allreduce
-        model = DDP(model, delay_allreduce=True)
+        # model = DDP(model, delay_allreduce=True)
+        model = DDP(model, device_ids=[args.local_rank])
 
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda()
@@ -250,13 +477,15 @@ def main():
         crop_size = 224
         val_size = 256
 
-    pipe = HybridTrainPipe(batch_size=args.batch_size, num_threads=args.workers, device_id=args.local_rank, data_dir=traindir, crop=crop_size, dali_cpu=args.dali_cpu)
+    train_list_file = "/mnt/lustre/chenyuntao1/datasets/imagenet/train.lst.full"
+    pipe = HybridTrainPipe(batch_size=args.batch_size, num_threads=args.workers, device_id=args.local_rank, data_dir=traindir, crop=crop_size, dali_cpu=args.dali_cpu, list_file=train_list_file)
     pipe.build()
-    train_loader = DALIClassificationIterator(pipe, size=int(pipe.epoch_size("Reader") / args.world_size))
+    train_loader = DALIClassificationIterator(pipe, size=pipe.epoch_size())
 
-    pipe = HybridValPipe(batch_size=args.batch_size, num_threads=args.workers, device_id=args.local_rank, data_dir=valdir, crop=crop_size, size=val_size)
+    val_list_file = "/mnt/lustre/chenyuntao1/datasets/imagenet/val.lst.full"
+    pipe = HybridValPipe(batch_size=args.batch_size, num_threads=args.workers, device_id=args.local_rank, data_dir=valdir, crop=crop_size, size=val_size, list_file=val_list_file)
     pipe.build()
-    val_loader = DALIClassificationIterator(pipe, size=int(pipe.epoch_size("Reader") / args.world_size))
+    val_loader = DALIClassificationIterator(pipe, size=pipe.epoch_size())
 
     if args.evaluate:
         validate(val_loader, model, criterion)
@@ -424,8 +653,9 @@ def validate(val_loader, model, criterion):
                    batch_time=batch_time, loss=losses,
                    top1=top1, top5=top5))
 
-    print(' * Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f}'
-          .format(top1=top1, top5=top5))
+    if args.local_rank == 0:
+        print(' * Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f}'
+            .format(top1=top1, top5=top5))
 
     return [top1.avg, top5.avg]
 
@@ -492,7 +722,7 @@ def accuracy(output, target, topk=(1,)):
 
 def reduce_tensor(tensor):
     rt = tensor.clone()
-    dist.all_reduce(rt, op=dist.reduce_op.SUM)
+    dist.all_reduce(rt, op=dist.ReduceOp.SUM)
     rt /= args.world_size
     return rt
 
