@@ -276,6 +276,10 @@ def main():
     args.gpu = 0
     args.world_size = 1
 
+    if args.evaluate:
+        # use a batch size that can be evenly divided
+        args.batch_size = 50
+
     if args.distributed:
         args.gpu = args.local_rank % torch.cuda.device_count()
         torch.cuda.set_device(args.gpu)
@@ -348,10 +352,11 @@ def main():
         crop_size = 224
         val_size = 256
 
-    train_list_file = "/mnt/lustre/chenyuntao1/datasets/imagenet/train.lst.full"
-    pipe = HybridTrainPipe(batch_size=args.batch_size, num_threads=args.workers, device_id=args.local_rank, data_dir=traindir, crop=crop_size, dali_cpu=args.dali_cpu, list_file=train_list_file)
-    pipe.build()
-    train_loader = DALIClassificationIterator(pipe, size=pipe.epoch_size())
+    if not args.evaluate:
+        train_list_file = "/mnt/lustre/chenyuntao1/datasets/imagenet/train.lst.full"
+        pipe = HybridTrainPipe(batch_size=args.batch_size, num_threads=args.workers, device_id=args.local_rank, data_dir=traindir, crop=crop_size, dali_cpu=args.dali_cpu, list_file=train_list_file)
+        pipe.build()
+        train_loader = DALIClassificationIterator(pipe, size=pipe.epoch_size())
 
     val_list_file = "/mnt/lustre/chenyuntao1/datasets/imagenet/val.lst.full"
     pipe = HybridValPipe(batch_size=args.batch_size, num_threads=args.workers, device_id=args.local_rank, data_dir=valdir, crop=crop_size, size=val_size, list_file=val_list_file)
