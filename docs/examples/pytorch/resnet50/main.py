@@ -45,6 +45,8 @@ parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
 parser.add_argument('--epochs', default=90, type=int, metavar='N',
                     help='number of total epochs to run')
+parser.add_argument('--lr-steps', default="30,60,80", type=str,
+                    help='when to reduce lr')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
 parser.add_argument('-b', '--batch-size', default=256, type=int,
@@ -152,7 +154,7 @@ class CachedInputIterator(object):
 
 class HybridTrainPipe(Pipeline):
     def __init__(self, batch_size, num_threads, device_id, list_file, data_dir, crop, dali_cpu=False):
-        super(HybridTrainPipe, self).__init__(batch_size, num_threads, device_id, seed=12 + device_id, prefetch_queue_depth=10)
+        super(HybridTrainPipe, self).__init__(batch_size, num_threads, device_id, seed=12 + device_id)
         self.input = ops.ExternalSource()
         self.input_label = ops.ExternalSource()
         self.iterator = CachedInputIterator(batch_size, list_file=list_file, data_dir=data_dir, shard_id=args.local_rank, num_shards=args.world_size, random_shuffle=True)
@@ -409,12 +411,17 @@ def train(train_loader, model, criterion, optimizer, epoch):
     model.train()
     end = time.time()
 
+    # lr steps
+    lr_steps = [int(_) for _ in args.lr_steps.split(",")]
+    if args.local_rank == 0:
+        print('lr_steps: {}'.format(lr_steps))
+
     for i, data in enumerate(train_loader):
         input = data[0]["data"]
         target = data[0]["label"].squeeze().cuda().long()
         train_loader_len = int(math.ceil(train_loader._size / args.batch_size))
 
-        adjust_learning_rate(optimizer, epoch, i, train_loader_len)
+        adjust_learning_rate(optimizer, lr_steps, epoch, i, train_loader_len)
 
         if args.prof:
             if i > 10:
@@ -560,12 +567,13 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
 
-def adjust_learning_rate(optimizer, epoch, step, len_epoch):
+def adjust_learning_rate(optimizer, lr_steps, epoch, step, len_epoch):
     """LR schedule that should yield 76% converged accuracy with batch size 256"""
-    factor = epoch // 30
-
-    if epoch >= 80:
-        factor = factor + 1
+    
+    try:
+        factor = [epoch < _ for _ in lr_steps].index(True)
+    except ValueError:
+        factor = len(lr_steps)
 
     lr = args.lr * (0.1 ** factor)
 
