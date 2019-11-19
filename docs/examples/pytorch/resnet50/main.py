@@ -325,7 +325,23 @@ def main():
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda()
 
-    optimizer = torch.optim.SGD(model.parameters(), args.lr,
+    # special model initialization
+    if args.evaluate:
+        params = model.parameters()
+    else:
+        params = []
+        for key, value in model.named_parameters():
+            param_group = {}
+            if args.no_bn_wd and re.search(r'(bn|gn)(\d+)?.(weight|bias)', key):
+                print_once(f"set wd of {key} to 0.0")
+                param_group["weight_decay"] = 0.0
+            if args.zero_init_resblock and 'bn3.weight' in key:
+                print_once(f"init {key} to 0.0")
+                nn.init.zero(value)
+            param_group["params"] = value
+            params += [param_group]
+
+    optimizer = torch.optim.SGD(params, args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
     if args.fp16:
