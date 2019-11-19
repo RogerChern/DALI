@@ -81,7 +81,8 @@ parser.add_argument('--prof', dest='prof', action='store_true',
                     help='Only run 10 iterations for profiling.')
 parser.add_argument('-t', '--test', action='store_true',
                     help='Launch test mode with preset arguments')
-
+parser.add_argument('--train-list', type=str, default=None)
+parser.add_argument('--val-list', type=str, default=None)
 parser.add_argument("--local_rank", default=0, type=int)
 
 cudnn.benchmark = True
@@ -367,7 +368,8 @@ def main():
             args.start_epoch = checkpoint['epoch']
             best_prec1 = checkpoint['best_prec1']
             model.load_state_dict(checkpoint['state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
+            # TODO: investigate into why state_dict length mismatches
+            # optimizer.load_state_dict(checkpoint['optimizer'])
             print_once("=> loaded checkpoint '{}' (epoch {})"
                   .format(args.resume, checkpoint['epoch']))
         else:
@@ -389,14 +391,14 @@ def main():
         val_size = 256
 
     if not args.evaluate:
-        train_list_file = "/mnt/lustre/chenyuntao1/datasets/imagenet/train.lst.full"
+        train_list_file = args.train_list or "/mnt/lustre/chenyuntao1/datasets/imagenet/train.lst.full"
         train_map_file = "/mnt/lustre/chenyuntao1/datasets/imagenet/train_file2chunk.pa"
         pipe = HybridTrainPipe(batch_size=args.batch_size, num_threads=args.workers, device_id=args.local_rank, data_dir=traindir, 
             crop=crop_size, dali_cpu=args.dali_cpu, list_file=train_list_file, map_file=train_map_file)
         pipe.build()
         train_loader = DALIClassificationIterator(pipe, size=pipe.epoch_size())
 
-    val_list_file = "/mnt/lustre/chenyuntao1/datasets/imagenet/val.lst.full"
+    val_list_file = args.val_list or "/mnt/lustre/chenyuntao1/datasets/imagenet/val.lst.full"
     val_map_file = "/mnt/lustre/chenyuntao1/datasets/imagenet/val_file2chunk.pa"
     pipe = HybridValPipe(batch_size=args.batch_size, num_threads=args.workers, device_id=args.local_rank, data_dir=valdir, 
         crop=crop_size, size=val_size, list_file=val_list_file, map_file=val_map_file)
