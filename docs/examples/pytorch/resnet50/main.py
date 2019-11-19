@@ -264,7 +264,7 @@ if 'WORLD_SIZE' in os.environ:
     args.distributed = int(os.environ['WORLD_SIZE']) > 1
 
 if args.fp16:
-    from apex.fp16_utils import *
+    from apex.fp16_utils import (network_to_half, FP16_Optimizer)
 
 # make apex optional
 if args.fp16 or args.distributed:
