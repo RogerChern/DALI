@@ -91,11 +91,14 @@ args = parser.parse_args()
 
 
 class CachedInputIterator(object):
-    def __init__(self, batch_size, list_file, data_dir, num_shards, shard_id, random_shuffle):
+    def __init__(self, batch_size, list_file, map_file, data_dir, num_shards, shard_id, random_shuffle):
         self.batch_size = batch_size
         self.num_shareds = num_shards
         self.shard_id = shard_id
         self.random_shuffle = random_shuffle
+        with open(map_file) as fin:
+            self.file_to_chunk = pa.deserialize_from(map_file, None)
+        self.loaded_chunks = set()
         self.file_list = []
         self.cache_dict = dict()
         self.label_list = []
@@ -122,9 +125,15 @@ class CachedInputIterator(object):
         self.shard_indexes = shard_indexes
 
     def warmup_cache(self):
-        for part in range(self.shard_indexes[0] // 1000, self.shard_indexes[-1] // 1000 + 1):
-            with open(os.path.join(self.data_dir, "%s.pa" % part), "rb") as fin:
-                self.cache_dict.update(pa.deserialize_from(fin, None))
+        for index in self.shard_indexes:
+            filename = self.file_list[index]
+            chunk_filename = self.file_to_chunk[filename]
+            if chunk_filename not in self.loaded_chunks:
+                self.loaded_chunks.add(chunk_filename)
+                print_once(f"loading {chunk_filename}")
+                with open(os.path.join(self.data_dir, chunk_filename), "rb") as fin:
+                    self.cache_dict.update(pa.deserialize_from(fin, None))
+        print_once(f"loaded {len(self.loaded_chunks)} chunks")
 
     def get_index(self):
         if self.index_queue.empty():
@@ -159,11 +168,11 @@ class CachedInputIterator(object):
 
 
 class HybridTrainPipe(Pipeline):
-    def __init__(self, batch_size, num_threads, device_id, list_file, data_dir, crop, dali_cpu=False):
+    def __init__(self, batch_size, num_threads, device_id, map_file, list_file, data_dir, crop, dali_cpu=False):
         super(HybridTrainPipe, self).__init__(batch_size, num_threads, device_id, seed=12 + device_id)
         self.input = ops.ExternalSource()
         self.input_label = ops.ExternalSource()
-        self.iterator = CachedInputIterator(batch_size, list_file=list_file, data_dir=data_dir, shard_id=args.local_rank, num_shards=args.world_size, random_shuffle=True)
+        self.iterator = CachedInputIterator(batch_size, map_file=map_file, list_file=list_file, data_dir=data_dir, shard_id=args.local_rank, num_shards=args.world_size, random_shuffle=True)
         # self.input = ops.FileReader(file_root=data_dir, shard_id=args.local_rank, num_shards=args.world_size, random_shuffle=True)
         #let user decide which pipeline works him bets for RN version he runs
         dali_device = 'cpu' if dali_cpu else 'gpu'
@@ -208,11 +217,11 @@ class HybridTrainPipe(Pipeline):
 
 
 class HybridValPipe(Pipeline):
-    def __init__(self, batch_size, num_threads, device_id, list_file, data_dir, crop, size):
+    def __init__(self, batch_size, num_threads, device_id, map_file, list_file, data_dir, crop, size):
         super(HybridValPipe, self).__init__(batch_size, num_threads, device_id, seed=12 + device_id)
         self.input = ops.ExternalSource()
         self.input_label = ops.ExternalSource()
-        self.iterator = CachedInputIterator(batch_size, list_file=list_file, data_dir=data_dir, shard_id=args.local_rank, num_shards=args.world_size, random_shuffle=False)
+        self.iterator = CachedInputIterator(batch_size, map_file=map_file, list_file=list_file, data_dir=data_dir, shard_id=args.local_rank, num_shards=args.world_size, random_shuffle=False)
         self.decode = ops.ImageDecoder(device="mixed", output_type=types.RGB)
         self.res = ops.Resize(device="gpu", resize_shorter=size, interp_type=types.INTERP_TRIANGULAR)
         self.cmnp = ops.CropMirrorNormalize(device="gpu",
@@ -333,11 +342,11 @@ def main():
         for key, value in model.named_parameters():
             param_group = {}
             if args.no_bn_wd and re.search(r'(bn|gn)(\d+)?.(weight|bias)', key):
-                print_once(f"set wd of {key} to 0.0")
+                print_once(f"set weight decay of {key} to 0.0")
                 param_group["weight_decay"] = 0.0
             if args.zero_init_resblock and 'bn3.weight' in key:
                 print_once(f"init {key} to 0.0")
-                nn.init.zero(value)
+                nn.init.zeros_(value)
             param_group["params"] = value
             params += [param_group]
 
@@ -381,12 +390,16 @@ def main():
 
     if not args.evaluate:
         train_list_file = "/mnt/lustre/chenyuntao1/datasets/imagenet/train.lst.full"
-        pipe = HybridTrainPipe(batch_size=args.batch_size, num_threads=args.workers, device_id=args.local_rank, data_dir=traindir, crop=crop_size, dali_cpu=args.dali_cpu, list_file=train_list_file)
+        train_map_file = "/mnt/lustre/chenyuntao1/datasets/imagenet/train_file2chunk.pa"
+        pipe = HybridTrainPipe(batch_size=args.batch_size, num_threads=args.workers, device_id=args.local_rank, data_dir=traindir, 
+            crop=crop_size, dali_cpu=args.dali_cpu, list_file=train_list_file, map_file=train_map_file)
         pipe.build()
         train_loader = DALIClassificationIterator(pipe, size=pipe.epoch_size())
 
     val_list_file = "/mnt/lustre/chenyuntao1/datasets/imagenet/val.lst.full"
-    pipe = HybridValPipe(batch_size=args.batch_size, num_threads=args.workers, device_id=args.local_rank, data_dir=valdir, crop=crop_size, size=val_size, list_file=val_list_file)
+    val_map_file = "/mnt/lustre/chenyuntao1/datasets/imagenet/val_file2chunk.pa"
+    pipe = HybridValPipe(batch_size=args.batch_size, num_threads=args.workers, device_id=args.local_rank, data_dir=valdir, 
+        crop=crop_size, size=val_size, list_file=val_list_file, map_file=val_map_file)
     pipe.build()
     val_loader = DALIClassificationIterator(pipe, size=pipe.epoch_size())
 
