@@ -421,6 +421,8 @@ def main():
         # evaluate on validation set
         if epoch > args.validate_start_epoch:
             [prec1, prec5] = validate(val_loader, model, criterion)
+        else:
+            prec1 = 0    
 
         # remember best prec@1 and save checkpoint
         if args.local_rank == 0:
