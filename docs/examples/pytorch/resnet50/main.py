@@ -83,7 +83,8 @@ parser.add_argument('-t', '--test', action='store_true',
                     help='Launch test mode with preset arguments')
 parser.add_argument('--train-list', type=str, default=None)
 parser.add_argument('--val-list', type=str, default=None)
-parser.add_argument('--validate-start-epoch', type=int, default=-1)
+parser.add_argument('--validate-start-epoch', type=int, default=-1, help='skip validation until a certain epoch')
+parser.add_argument('--nag', action='store_true', help='use nesterov momentum')
 parser.add_argument("--local_rank", default=0, type=int)
 
 cudnn.benchmark = True
@@ -354,7 +355,8 @@ def main():
 
     optimizer = torch.optim.SGD(params, args.lr,
                                 momentum=args.momentum,
-                                weight_decay=args.weight_decay)
+                                weight_decay=args.weight_decay,
+                                nesterov=args.nag)
     if args.fp16:
         optimizer = FP16_Optimizer(optimizer,
                                    static_loss_scale=args.static_loss_scale,
