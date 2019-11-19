@@ -5,6 +5,7 @@ import time
 import math
 import queue
 import random
+import re
 
 import pyarrow as pa
 import numpy as np
@@ -57,6 +58,8 @@ parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                     help='momentum')
 parser.add_argument('--weight-decay', '--wd', default=1e-4, type=float,
                     metavar='W', help='weight decay (default: 1e-4)')
+parser.add_argument('--no-bn-wd', action='store_true')
+parser.add_argument('--zero-init-resblock', action='store_true')
 parser.add_argument('--print-freq', '-p', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
@@ -82,6 +85,9 @@ parser.add_argument('-t', '--test', action='store_true',
 parser.add_argument("--local_rank", default=0, type=int)
 
 cudnn.benchmark = True
+
+best_prec1 = 0
+args = parser.parse_args()
 
 
 class CachedInputIterator(object):
@@ -181,7 +187,7 @@ class HybridTrainPipe(Pipeline):
                                             mean=[0.485 * 255,0.456 * 255,0.406 * 255],
                                             std=[0.229 * 255,0.224 * 255,0.225 * 255])
         self.coin = ops.CoinFlip(probability=0.5)
-        print('DALI "{0}" variant'.format(dali_device))
+        print_once('DALI "{0}" variant'.format(dali_device))
 
     def define_graph(self):
         rng = self.coin()
@@ -233,8 +239,10 @@ class HybridValPipe(Pipeline):
     def epoch_size(self):
         return self.iterator.epoch_size()
 
-best_prec1 = 0
-args = parser.parse_args()
+
+def print_once(input_string):
+    if args.local_rank == 0:
+         print(input_string)
 
 # test mode, use default args for sanity test
 if args.test:
@@ -296,14 +304,14 @@ def main():
 
     if args.static_loss_scale != 1.0:
         if not args.fp16:
-            print("Warning:  if --fp16 is not used, static_loss_scale will be ignored.")
+            print_once("Warning:  if --fp16 is not used, static_loss_scale will be ignored.")
 
     # create model
     if args.pretrained:
-        print("=> using pre-trained model '{}'".format(args.arch))
+        print_once("=> using pre-trained model '{}'".format(args.arch))
         model = models.__dict__[args.arch](pretrained=True)
     else:
-        print("=> creating model '{}'".format(args.arch))
+        print_once("=> creating model '{}'".format(args.arch))
         model = models.__dict__[args.arch]()
 
     model = model.cuda()
@@ -323,21 +331,22 @@ def main():
     if args.fp16:
         optimizer = FP16_Optimizer(optimizer,
                                    static_loss_scale=args.static_loss_scale,
-                                   dynamic_loss_scale=args.dynamic_loss_scale)
+                                   dynamic_loss_scale=args.dynamic_loss_scale,
+                                   verbose=args.local_rank == 0)
 
     # optionally resume from a checkpoint
     if args.resume:
         if os.path.isfile(args.resume):
-            print("=> loading checkpoint '{}'".format(args.resume))
+            print_once("=> loading checkpoint '{}'".format(args.resume))
             checkpoint = torch.load(args.resume, map_location=lambda storage, loc: storage.cuda(args.gpu))
             args.start_epoch = checkpoint['epoch']
             best_prec1 = checkpoint['best_prec1']
             model.load_state_dict(checkpoint['state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer'])
-            print("=> loaded checkpoint '{}' (epoch {})"
+            print_once("=> loaded checkpoint '{}' (epoch {})"
                   .format(args.resume, checkpoint['epoch']))
         else:
-            print("=> no checkpoint found at '{}'".format(args.resume))
+            print_once("=> no checkpoint found at '{}'".format(args.resume))
 
     # Data loading code
     if len(args.data) == 1:
@@ -392,7 +401,7 @@ def main():
                 'optimizer': optimizer.state_dict(),
             }, is_best)
             if epoch == args.epochs - 1:
-                print('##Top-1 {0}\n'
+                print_once('##Top-1 {0}\n'
                       '##Top-5 {1}\n'
                       '##Perf  {2}'.format(prec1, prec5, args.total_batch_size / total_time.avg))
 
@@ -413,8 +422,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
 
     # lr steps
     lr_steps = [int(_) for _ in args.lr_steps.split(",")]
-    if args.local_rank == 0:
-        print('lr_steps: {}'.format(lr_steps))
+    print_once('lr_steps: {}'.format(lr_steps))
 
     for i, data in enumerate(train_loader):
         input = data[0]["data"]
@@ -464,8 +472,8 @@ def train(train_loader, model, criterion, optimizer, epoch):
 
         end = time.time()
 
-        if args.local_rank == 0 and i % args.print_freq == 0 and i > 1:
-            print('Epoch: [{0}][{1}/{2}]\t'
+        if i % args.print_freq == 0 and i > 1:
+            print_once('Epoch: [{0}][{1}/{2}]\t'
                   'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                   'Speed {3:.3f} ({4:.3f})\t'
                   'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
@@ -523,8 +531,8 @@ def validate(val_loader, model, criterion):
         batch_time.update(time.time() - end)
         end = time.time()
 
-        if args.local_rank == 0 and i % args.print_freq == 0:
-            print('Test: [{0}/{1}]\t'
+        if i % args.print_freq == 0:
+            print_once('Test: [{0}/{1}]\t'
                   'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                   'Speed {2:.3f} ({3:.3f})\t'
                   'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
@@ -536,8 +544,7 @@ def validate(val_loader, model, criterion):
                    batch_time=batch_time, loss=losses,
                    top1=top1, top5=top5))
 
-    if args.local_rank == 0:
-        print(' * Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f}'
+    print_once(' * Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f}'
             .format(top1=top1, top5=top5))
 
     return [top1.avg, top5.avg]
@@ -581,8 +588,8 @@ def adjust_learning_rate(optimizer, lr_steps, epoch, step, len_epoch):
     if epoch < 5:
         lr = lr * float(1 + step + epoch * len_epoch) / (5. * len_epoch)
 
-    if(args.local_rank == 0 and step % args.print_freq == 0 and step > 1):
-        print("Epoch = {}, step = {}, lr = {}".format(epoch, step, lr))
+    if step % args.print_freq == 0 and step > 1:
+        print_once("Epoch = {}, step = {}, lr = {}".format(epoch, step, lr))
 
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
