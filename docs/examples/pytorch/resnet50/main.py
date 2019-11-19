@@ -83,6 +83,7 @@ parser.add_argument('-t', '--test', action='store_true',
                     help='Launch test mode with preset arguments')
 parser.add_argument('--train-list', type=str, default=None)
 parser.add_argument('--val-list', type=str, default=None)
+parser.add_argument('--validate-start-epoch', type=int, default=-1)
 parser.add_argument("--local_rank", default=0, type=int)
 
 cudnn.benchmark = True
@@ -418,7 +419,8 @@ def main():
         if args.prof:
             break
         # evaluate on validation set
-        [prec1, prec5] = validate(val_loader, model, criterion)
+        if epoch > args.validate_start_epoch:
+            [prec1, prec5] = validate(val_loader, model, criterion)
 
         # remember best prec@1 and save checkpoint
         if args.local_rank == 0:
