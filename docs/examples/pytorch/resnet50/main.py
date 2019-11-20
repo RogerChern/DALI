@@ -82,9 +82,12 @@ parser.add_argument('--prof', dest='prof', action='store_true',
 parser.add_argument('-t', '--test', action='store_true',
                     help='Launch test mode with preset arguments')
 parser.add_argument('--train-list', type=str, default=None)
+parser.add_argument('--train-map', type=str, default=None)
 parser.add_argument('--val-list', type=str, default=None)
+parser.add_argument('--val-map', type=str, default=None)
 parser.add_argument('--validate-start-epoch', type=int, default=-1, help='skip validation until a certain epoch')
 parser.add_argument('--nag', action='store_true', help='use nesterov momentum')
+parser.add_argument('-x', '--feature-extract', dest='feature_extract', action='store_true')
 parser.add_argument("--local_rank", default=0, type=int)
 
 cudnn.benchmark = True
@@ -252,6 +255,37 @@ class HybridValPipe(Pipeline):
         return self.iterator.epoch_size()
 
 
+class ResNetFeatureExtractor(nn.Module):
+    def __init__(self, resnet):
+        super().__init__()
+        self.conv1 = resnet.conv1
+        self.bn1 = resnet.bn1
+        self.relu = resnet.relu
+        self.maxpool = resnet.maxpool
+        self.layer1 = resnet.layer1
+        self.layer2 = resnet.layer2
+        self.layer3 = resnet.layer3
+        self.layer4 = resnet.layer4
+        self.avgpool = resnet.avgpool
+        self.fc = resnet.fc
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+
+        return x
+
+
 def print_once(input_string):
     if args.local_rank == 0:
          print(input_string)
@@ -298,7 +332,7 @@ def main():
     args.gpu = 0
     args.world_size = 1
 
-    if args.evaluate:
+    if args.evaluate or args.feature_extract:
         # use a batch size that can be evenly divided
         args.batch_size = 50
 
@@ -326,6 +360,9 @@ def main():
         print_once("=> creating model '{}'".format(args.arch))
         model = models.__dict__[args.arch]()
 
+    if args.feature_extract:
+        model = ResNetFeatureExtractor(model)
+
     model = model.cuda()
     if args.fp16:
         model = network_to_half(model)
@@ -338,7 +375,7 @@ def main():
     criterion = nn.CrossEntropyLoss().cuda()
 
     # special model initialization
-    if args.evaluate:
+    if args.evaluate or args.feature_extract:
         params = model.parameters()
     else:
         params = []
@@ -393,20 +430,24 @@ def main():
         crop_size = 224
         val_size = 256
 
-    if not args.evaluate:
+    if (not args.evaluate) and (not args.feature_extract):
         train_list_file = args.train_list or "/mnt/lustre/chenyuntao1/datasets/imagenet/train.lst.full"
-        train_map_file = "/mnt/lustre/chenyuntao1/datasets/imagenet/train_file2chunk.pa"
+        train_map_file = args.train_map or "/mnt/lustre/chenyuntao1/datasets/imagenet/train_file2chunk.pa"
         pipe = HybridTrainPipe(batch_size=args.batch_size, num_threads=args.workers, device_id=args.local_rank, data_dir=traindir, 
             crop=crop_size, dali_cpu=args.dali_cpu, list_file=train_list_file, map_file=train_map_file)
         pipe.build()
         train_loader = DALIClassificationIterator(pipe, size=pipe.epoch_size())
 
     val_list_file = args.val_list or "/mnt/lustre/chenyuntao1/datasets/imagenet/val.lst.full"
-    val_map_file = "/mnt/lustre/chenyuntao1/datasets/imagenet/val_file2chunk.pa"
+    val_map_file = args.val_map or "/mnt/lustre/chenyuntao1/datasets/imagenet/val_file2chunk.pa"
     pipe = HybridValPipe(batch_size=args.batch_size, num_threads=args.workers, device_id=args.local_rank, data_dir=valdir, 
         crop=crop_size, size=val_size, list_file=val_list_file, map_file=val_map_file)
     pipe.build()
     val_loader = DALIClassificationIterator(pipe, size=pipe.epoch_size())
+
+    if args.feature_extract:
+        feature_extraction(val_loader, model)
+        return
 
     if args.evaluate:
         validate(val_loader, model, criterion)
@@ -585,6 +626,46 @@ def validate(val_loader, model, criterion):
             .format(top1=top1, top5=top5))
 
     return [top1.avg, top5.avg]
+
+
+def feature_extraction(loader, model):
+    batch_time = AverageMeter()
+
+    # switch to evaluate mode
+    model.eval()
+
+    end = time.time()
+    batch_feat_list = []
+    for i, data in enumerate(loader):
+        input = data[0]["data"]
+        # target = data[0]["label"].squeeze().cuda().long()
+        loader_len = int(math.ceil(loader._size / args.batch_size))
+
+        # target = target.cuda(non_blocking=True)
+        input_var = Variable(input)
+        # target_var = Variable(target)
+
+        # compute output
+        with torch.no_grad():
+            output = model(input_var)
+        
+        batch_feat_list.append(output)
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        if i % args.print_freq == 0:
+            print_once('Test: [{0}/{1}]\t'
+                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  'Speed {2:.3f} ({3:.3f})\t'.format(
+                   i, loader_len,
+                   args.total_batch_size / batch_time.val,
+                   args.total_batch_size / batch_time.avg,
+                   batch_time=batch_time))
+    
+    feat_list = torch.stack(batch_feat_list)
+    pa.serialize_to(feat_list.cpu().numpy(), open('image_features_part%d' % args.local_rank, 'wb'))
 
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
