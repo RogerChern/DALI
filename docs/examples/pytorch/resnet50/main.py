@@ -127,13 +127,6 @@ if args.fp16 or args.distributed:
     except ImportError:
         raise ImportError("Please install apex from https://www.github.com/nvidia/apex to run this example.")
 
-# item() is a recent addition, so this helps with backward compatibility.
-def to_python_float(t):
-    if hasattr(t, 'item'):
-        return t.item()
-    else:
-        return t[0]
-
 def main():
     global best_prec1, args
 
@@ -304,7 +297,6 @@ def train(train_loader, model, criterion, optimizer, epoch):
 
     # lr steps
     lr_steps = [int(_) for _ in args.lr_steps.split(",")]
-    print_once('lr_steps: {}'.format(lr_steps))
 
     for i, data in enumerate(train_loader):
         input = data[0]["data"]
@@ -635,6 +627,12 @@ class CachedInputIterator(object):
 
     next = __next__
 
+# item() is a recent addition, so this helps with backward compatibility.
+def to_python_float(t):
+    if hasattr(t, 'item'):
+        return t.item()
+    else:
+        return t[0]
 
 def print_once(input_string):
     if args.local_rank == 0:
