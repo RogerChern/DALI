@@ -89,6 +89,8 @@ parser.add_argument('--val-map', type=str, default=None)
 parser.add_argument('--validate-start-epoch', type=int, default=-1, help='skip validation until a certain epoch')
 parser.add_argument('--nag', action='store_true', help='use nesterov momentum')
 parser.add_argument('-x', '--feature-extract', dest='feature_extract', action='store_true')
+parser.add_argument('--cos-lr', action='store_true')
+parser.add_argument('--warmup-epochs', type=int, default=5)
 parser.add_argument("--local_rank", default=0, type=int)
 
 cudnn.benchmark = True
@@ -504,7 +506,10 @@ def train(train_loader, model, criterion, optimizer, epoch):
         target = data[0]["label"].squeeze().cuda().long()
         train_loader_len = int(math.ceil(train_loader._size / args.batch_size))
 
-        adjust_learning_rate(optimizer, lr_steps, epoch, i, train_loader_len)
+        if args.cos_lr:
+            adjust_learning_rate_cosine(optimizer, epoch, i, train_loader_len)
+        else:
+            adjust_learning_rate(optimizer, lr_steps, epoch, i, train_loader_len)
 
         if args.prof:
             if i > 10:
@@ -700,7 +705,24 @@ def adjust_learning_rate(optimizer, lr_steps, epoch, step, len_epoch):
     lr = args.lr * (0.1 ** factor)
 
     """Warmup"""
-    if epoch < 5:
+    if epoch < args.warmup_epochs:
+        lr = lr * float(1 + step + epoch * len_epoch) / (5. * len_epoch)
+
+    if step % args.print_freq == 0 and step > 1:
+        print_once("Epoch = {}, step = {}, lr = {}".format(epoch, step, lr))
+
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
+
+def adjust_learning_rate_cosine(optimizer, epoch, step, len_epoch):
+    factor = (step + epoch * len_epoch) / (args.epochs * len_epoch)
+    factor = 0.5 * (1 + math.cos(factor * math.pi))
+
+    lr = args.lr * factor
+
+    """Warmup"""
+    if epoch < args.warmup_epochs:
         lr = lr * float(1 + step + epoch * len_epoch) / (5. * len_epoch)
 
     if step % args.print_freq == 0 and step > 1:
