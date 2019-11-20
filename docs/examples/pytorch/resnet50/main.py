@@ -98,201 +98,6 @@ cudnn.benchmark = True
 best_prec1 = 0
 args = parser.parse_args()
 
-
-class CachedInputIterator(object):
-    def __init__(self, batch_size, list_file, map_file, data_dir, num_shards, shard_id, random_shuffle):
-        self.batch_size = batch_size
-        self.num_shareds = num_shards
-        self.shard_id = shard_id
-        self.random_shuffle = random_shuffle
-        with open(map_file) as fin:
-            self.file_to_chunk = pa.deserialize_from(map_file, None)
-        self.loaded_chunks = set()
-        self.file_list = []
-        self.cache_dict = dict()
-        self.label_list = []
-        self.data_dir = data_dir
-        with open(list_file) as fin:
-            for line in fin:
-                filename, label = line.strip().split('\t')
-                label = int(label)
-                self.file_list.append(filename)
-                self.label_list.append(label)
-        self.index_queue = queue.Queue()
-        self.shard_size = None
-        self.shard_indexes = None
-        self.setup_shard()
-        self.warmup_cache()
-
-    def setup_shard(self):
-        shard_size = len(self.file_list) // self.num_shareds
-        # [start, end)
-        shard_start = shard_size * self.shard_id
-        shard_end = len(self.file_list) if self.shard_id == self.num_shareds - 1 else shard_size * (self.shard_id + 1)
-        shard_indexes = list(range(shard_start, shard_end))
-        self.shard_size = shard_size
-        self.shard_indexes = shard_indexes
-
-    def warmup_cache(self):
-        for index in self.shard_indexes:
-            filename = self.file_list[index]
-            chunk_filename = self.file_to_chunk[filename]
-            if chunk_filename not in self.loaded_chunks:
-                self.loaded_chunks.add(chunk_filename)
-                print_once(f"loading {chunk_filename}")
-                with open(os.path.join(self.data_dir, chunk_filename), "rb") as fin:
-                    self.cache_dict.update(pa.deserialize_from(fin, None))
-        print_once(f"loaded {len(self.loaded_chunks)} chunks")
-
-    def get_index(self):
-        if self.index_queue.empty():
-            if self.random_shuffle:
-                random.shuffle(self.shard_indexes)
-            # keep all shards of the same size
-            for ind in self.shard_indexes[:self.shard_size]:
-                self.index_queue.put(ind)
-        return self.index_queue.get()
-
-    def epoch_size(self):
-        return len(self.file_list) // self.num_shareds
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        jpegs = []
-        labels = []
-        for _ in range(self.batch_size):
-            ind = self.get_index()
-            filename = self.file_list[ind]
-            label = self.label_list[ind]
-
-            value = self.cache_dict[filename]
-            # DO NOT reuse the buffer
-            jpegs.append(value)
-            labels.append(np.array([label], dtype=np.int32))
-        return jpegs, labels
-
-    next = __next__
-
-
-class HybridTrainPipe(Pipeline):
-    def __init__(self, batch_size, num_threads, device_id, map_file, list_file, data_dir, crop, dali_cpu=False):
-        super(HybridTrainPipe, self).__init__(batch_size, num_threads, device_id, seed=12 + device_id)
-        self.input = ops.ExternalSource()
-        self.input_label = ops.ExternalSource()
-        self.iterator = CachedInputIterator(batch_size, map_file=map_file, list_file=list_file, data_dir=data_dir, shard_id=args.local_rank, num_shards=args.world_size, random_shuffle=True)
-        # self.input = ops.FileReader(file_root=data_dir, shard_id=args.local_rank, num_shards=args.world_size, random_shuffle=True)
-        #let user decide which pipeline works him bets for RN version he runs
-        dali_device = 'cpu' if dali_cpu else 'gpu'
-        decoder_device = 'cpu' if dali_cpu else 'mixed'
-        # This padding sets the size of the internal nvJPEG buffers to be able to handle all images from full-sized ImageNet
-        # without additional reallocations
-        device_memory_padding = 211025920 if decoder_device == 'mixed' else 0
-        host_memory_padding = 140544512 if decoder_device == 'mixed' else 0
-        self.decode = ops.ImageDecoderRandomCrop(device=decoder_device, output_type=types.RGB,
-                                                 device_memory_padding=device_memory_padding,
-                                                 host_memory_padding=host_memory_padding,
-                                                 random_aspect_ratio=[0.8, 1.25],
-                                                 random_area=[0.1, 1.0],
-                                                 num_attempts=100)
-        self.res = ops.Resize(device=dali_device, resize_x=crop, resize_y=crop, interp_type=types.INTERP_TRIANGULAR)
-        self.cmnp = ops.CropMirrorNormalize(device="gpu",
-                                            output_dtype=types.FLOAT,
-                                            output_layout=types.NCHW,
-                                            crop=(crop, crop),
-                                            image_type=types.RGB,
-                                            mean=[0.485 * 255,0.456 * 255,0.406 * 255],
-                                            std=[0.229 * 255,0.224 * 255,0.225 * 255])
-        self.coin = ops.CoinFlip(probability=0.5)
-        print_once('DALI "{0}" variant'.format(dali_device))
-
-    def define_graph(self):
-        rng = self.coin()
-        self.jpegs = self.input()
-        self.labels = self.input_label()
-        images = self.decode(self.jpegs)
-        images = self.res(images)
-        output = self.cmnp(images.gpu(), mirror=rng)
-        return [output, self.labels]
-
-    def iter_setup(self):
-        images, labels = self.iterator.next()
-        self.feed_input(self.jpegs, images)
-        self.feed_input(self.labels, labels)
-
-    def epoch_size(self):
-        return self.iterator.epoch_size()
-
-
-class HybridValPipe(Pipeline):
-    def __init__(self, batch_size, num_threads, device_id, map_file, list_file, data_dir, crop, size):
-        super(HybridValPipe, self).__init__(batch_size, num_threads, device_id, seed=12 + device_id)
-        self.input = ops.ExternalSource()
-        self.input_label = ops.ExternalSource()
-        self.iterator = CachedInputIterator(batch_size, map_file=map_file, list_file=list_file, data_dir=data_dir, shard_id=args.local_rank, num_shards=args.world_size, random_shuffle=False)
-        self.decode = ops.ImageDecoder(device="mixed", output_type=types.RGB)
-        self.res = ops.Resize(device="gpu", resize_shorter=size, interp_type=types.INTERP_TRIANGULAR)
-        self.cmnp = ops.CropMirrorNormalize(device="gpu",
-                                            output_dtype=types.FLOAT,
-                                            output_layout=types.NCHW,
-                                            crop=(crop, crop),
-                                            image_type=types.RGB,
-                                            mean=[0.485 * 255,0.456 * 255,0.406 * 255],
-                                            std=[0.229 * 255,0.224 * 255,0.225 * 255])
-
-    def define_graph(self):
-        self.jpegs = self.input()
-        self.labels = self.input_label()
-        images = self.decode(self.jpegs)
-        images = self.res(images)
-        output = self.cmnp(images)
-        return [output, self.labels]
-
-    def iter_setup(self):
-        images, labels = self.iterator.next()
-        self.feed_input(self.jpegs, images)
-        self.feed_input(self.labels, labels)
-
-    def epoch_size(self):
-        return self.iterator.epoch_size()
-
-
-class ResNetFeatureExtractor(nn.Module):
-    def __init__(self, resnet):
-        super().__init__()
-        self.conv1 = resnet.conv1
-        self.bn1 = resnet.bn1
-        self.relu = resnet.relu
-        self.maxpool = resnet.maxpool
-        self.layer1 = resnet.layer1
-        self.layer2 = resnet.layer2
-        self.layer3 = resnet.layer3
-        self.layer4 = resnet.layer4
-        self.avgpool = resnet.avgpool
-        self.fc = resnet.fc
-
-    def forward(self, x):
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.maxpool(x)
-
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
-
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
-
-        return x
-
-
-def print_once(input_string):
-    if args.local_rank == 0:
-         print(input_string)
-
 # test mode, use default args for sanity test
 if args.test:
     args.fp16 = False
@@ -706,7 +511,7 @@ def adjust_learning_rate(optimizer, lr_steps, epoch, step, len_epoch):
 
     """Warmup"""
     if epoch < args.warmup_epochs:
-        lr = lr * float(1 + step + epoch * len_epoch) / (5. * len_epoch)
+        lr = lr * float(1 + step + epoch * len_epoch) / (args.warmup_epochs * len_epoch)
 
     if step % args.print_freq == 0 and step > 1:
         print_once("Epoch = {}, step = {}, lr = {}".format(epoch, step, lr))
@@ -723,7 +528,7 @@ def adjust_learning_rate_cosine(optimizer, epoch, step, len_epoch):
 
     """Warmup"""
     if epoch < args.warmup_epochs:
-        lr = lr * float(1 + step + epoch * len_epoch) / (5. * len_epoch)
+        lr = lr * float(1 + step + epoch * len_epoch) / (args.warmup_epochs * len_epoch)
 
     if step % args.print_freq == 0 and step > 1:
         print_once("Epoch = {}, step = {}, lr = {}".format(epoch, step, lr))
@@ -753,6 +558,201 @@ def reduce_tensor(tensor):
     dist.all_reduce(rt, op=dist.ReduceOp.SUM)
     rt /= args.world_size
     return rt
+
+class CachedInputIterator(object):
+    def __init__(self, batch_size, list_file, map_file, data_dir, num_shards, shard_id, random_shuffle):
+        self.batch_size = batch_size
+        self.num_shareds = num_shards
+        self.shard_id = shard_id
+        self.random_shuffle = random_shuffle
+        with open(map_file) as fin:
+            self.file_to_chunk = pa.deserialize_from(map_file, None)
+        self.loaded_chunks = set()
+        self.file_list = []
+        self.cache_dict = dict()
+        self.label_list = []
+        self.data_dir = data_dir
+        with open(list_file) as fin:
+            for line in fin:
+                filename, label = line.strip().split('\t')
+                label = int(label)
+                self.file_list.append(filename)
+                self.label_list.append(label)
+        self.index_queue = queue.Queue()
+        self.shard_size = None
+        self.shard_indexes = None
+        self.setup_shard()
+        self.warmup_cache()
+
+    def setup_shard(self):
+        shard_size = len(self.file_list) // self.num_shareds
+        # [start, end)
+        shard_start = shard_size * self.shard_id
+        shard_end = len(self.file_list) if self.shard_id == self.num_shareds - 1 else shard_size * (self.shard_id + 1)
+        shard_indexes = list(range(shard_start, shard_end))
+        self.shard_size = shard_size
+        self.shard_indexes = shard_indexes
+
+    def warmup_cache(self):
+        for index in self.shard_indexes:
+            filename = self.file_list[index]
+            chunk_filename = self.file_to_chunk[filename]
+            if chunk_filename not in self.loaded_chunks:
+                self.loaded_chunks.add(chunk_filename)
+                print_once(f"loading {chunk_filename}")
+                with open(os.path.join(self.data_dir, chunk_filename), "rb") as fin:
+                    self.cache_dict.update(pa.deserialize_from(fin, None))
+        print_once(f"loaded {len(self.loaded_chunks)} chunks")
+
+    def get_index(self):
+        if self.index_queue.empty():
+            if self.random_shuffle:
+                random.shuffle(self.shard_indexes)
+            # keep all shards of the same size
+            for ind in self.shard_indexes[:self.shard_size]:
+                self.index_queue.put(ind)
+        return self.index_queue.get()
+
+    def epoch_size(self):
+        return len(self.file_list) // self.num_shareds
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        jpegs = []
+        labels = []
+        for _ in range(self.batch_size):
+            ind = self.get_index()
+            filename = self.file_list[ind]
+            label = self.label_list[ind]
+
+            value = self.cache_dict[filename]
+            # DO NOT reuse the buffer
+            jpegs.append(value)
+            labels.append(np.array([label], dtype=np.int32))
+        return jpegs, labels
+
+    next = __next__
+
+
+def print_once(input_string):
+    if args.local_rank == 0:
+         print(input_string)
+
+
+class HybridTrainPipe(Pipeline):
+    def __init__(self, batch_size, num_threads, device_id, map_file, list_file, data_dir, crop, dali_cpu=False):
+        super(HybridTrainPipe, self).__init__(batch_size, num_threads, device_id, seed=12 + device_id)
+        self.input = ops.ExternalSource()
+        self.input_label = ops.ExternalSource()
+        self.iterator = CachedInputIterator(batch_size, map_file=map_file, list_file=list_file, data_dir=data_dir, shard_id=args.local_rank, num_shards=args.world_size, random_shuffle=True)
+        # self.input = ops.FileReader(file_root=data_dir, shard_id=args.local_rank, num_shards=args.world_size, random_shuffle=True)
+        #let user decide which pipeline works him bets for RN version he runs
+        dali_device = 'cpu' if dali_cpu else 'gpu'
+        decoder_device = 'cpu' if dali_cpu else 'mixed'
+        # This padding sets the size of the internal nvJPEG buffers to be able to handle all images from full-sized ImageNet
+        # without additional reallocations
+        device_memory_padding = 211025920 if decoder_device == 'mixed' else 0
+        host_memory_padding = 140544512 if decoder_device == 'mixed' else 0
+        self.decode = ops.ImageDecoderRandomCrop(device=decoder_device, output_type=types.RGB,
+                                                 device_memory_padding=device_memory_padding,
+                                                 host_memory_padding=host_memory_padding,
+                                                 random_aspect_ratio=[0.8, 1.25],
+                                                 random_area=[0.1, 1.0],
+                                                 num_attempts=100)
+        self.res = ops.Resize(device=dali_device, resize_x=crop, resize_y=crop, interp_type=types.INTERP_TRIANGULAR)
+        self.cmnp = ops.CropMirrorNormalize(device="gpu",
+                                            output_dtype=types.FLOAT,
+                                            output_layout=types.NCHW,
+                                            crop=(crop, crop),
+                                            image_type=types.RGB,
+                                            mean=[0.485 * 255,0.456 * 255,0.406 * 255],
+                                            std=[0.229 * 255,0.224 * 255,0.225 * 255])
+        self.coin = ops.CoinFlip(probability=0.5)
+        print_once('DALI "{0}" variant'.format(dali_device))
+
+    def define_graph(self):
+        rng = self.coin()
+        self.jpegs = self.input()
+        self.labels = self.input_label()
+        images = self.decode(self.jpegs)
+        images = self.res(images)
+        output = self.cmnp(images.gpu(), mirror=rng)
+        return [output, self.labels]
+
+    def iter_setup(self):
+        images, labels = self.iterator.next()
+        self.feed_input(self.jpegs, images)
+        self.feed_input(self.labels, labels)
+
+    def epoch_size(self):
+        return self.iterator.epoch_size()
+
+
+class HybridValPipe(Pipeline):
+    def __init__(self, batch_size, num_threads, device_id, map_file, list_file, data_dir, crop, size):
+        super(HybridValPipe, self).__init__(batch_size, num_threads, device_id, seed=12 + device_id)
+        self.input = ops.ExternalSource()
+        self.input_label = ops.ExternalSource()
+        self.iterator = CachedInputIterator(batch_size, map_file=map_file, list_file=list_file, data_dir=data_dir, shard_id=args.local_rank, num_shards=args.world_size, random_shuffle=False)
+        self.decode = ops.ImageDecoder(device="mixed", output_type=types.RGB)
+        self.res = ops.Resize(device="gpu", resize_shorter=size, interp_type=types.INTERP_TRIANGULAR)
+        self.cmnp = ops.CropMirrorNormalize(device="gpu",
+                                            output_dtype=types.FLOAT,
+                                            output_layout=types.NCHW,
+                                            crop=(crop, crop),
+                                            image_type=types.RGB,
+                                            mean=[0.485 * 255,0.456 * 255,0.406 * 255],
+                                            std=[0.229 * 255,0.224 * 255,0.225 * 255])
+
+    def define_graph(self):
+        self.jpegs = self.input()
+        self.labels = self.input_label()
+        images = self.decode(self.jpegs)
+        images = self.res(images)
+        output = self.cmnp(images)
+        return [output, self.labels]
+
+    def iter_setup(self):
+        images, labels = self.iterator.next()
+        self.feed_input(self.jpegs, images)
+        self.feed_input(self.labels, labels)
+
+    def epoch_size(self):
+        return self.iterator.epoch_size()
+
+
+class ResNetFeatureExtractor(nn.Module):
+    def __init__(self, resnet):
+        super().__init__()
+        self.conv1 = resnet.conv1
+        self.bn1 = resnet.bn1
+        self.relu = resnet.relu
+        self.maxpool = resnet.maxpool
+        self.layer1 = resnet.layer1
+        self.layer2 = resnet.layer2
+        self.layer3 = resnet.layer3
+        self.layer4 = resnet.layer4
+        self.avgpool = resnet.avgpool
+        self.fc = resnet.fc
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+
+        return x
+
 
 if __name__ == '__main__':
     main()
