@@ -52,6 +52,7 @@ parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
 parser.add_argument('-b', '--batch-size', default=256, type=int,
                     metavar='N', help='mini-batch size (default: 256)')
+parser.add_argument('--val-batch-size', type=int, default=25)
 parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
                     metavar='LR', help='initial learning rate')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
@@ -332,10 +333,6 @@ def main():
     args.gpu = 0
     args.world_size = 1
 
-    if args.evaluate or args.feature_extract:
-        # use a batch size that can be evenly divided
-        args.batch_size = 50
-
     if args.distributed:
         args.gpu = args.local_rank % torch.cuda.device_count()
         torch.cuda.set_device(args.gpu)
@@ -440,7 +437,7 @@ def main():
 
     val_list_file = args.val_list or "/mnt/lustre/chenyuntao1/datasets/imagenet/val.lst.full"
     val_map_file = args.val_map or "/mnt/lustre/chenyuntao1/datasets/imagenet/val_file2chunk.pa"
-    pipe = HybridValPipe(batch_size=args.batch_size, num_threads=args.workers, device_id=args.local_rank, data_dir=valdir, 
+    pipe = HybridValPipe(batch_size=args.val_batch_size, num_threads=args.workers, device_id=args.local_rank, data_dir=valdir, 
         crop=crop_size, size=val_size, list_file=val_list_file, map_file=val_map_file)
     pipe.build()
     val_loader = DALIClassificationIterator(pipe, size=pipe.epoch_size())
@@ -580,7 +577,7 @@ def validate(val_loader, model, criterion):
     for i, data in enumerate(val_loader):
         input = data[0]["data"]
         target = data[0]["label"].squeeze().cuda().long()
-        val_loader_len = int(val_loader._size / args.batch_size)
+        val_loader_len = int(val_loader._size / args.val_batch_size)
 
         target = target.cuda(non_blocking=True)
         input_var = Variable(input)
@@ -617,8 +614,8 @@ def validate(val_loader, model, criterion):
                   'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
                   'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
                    i, val_loader_len,
-                   args.total_batch_size / batch_time.val,
-                   args.total_batch_size / batch_time.avg,
+                   args.val_batch_size * args.world_size / batch_time.val,
+                   args.val_batch_size * args.world_size / batch_time.avg,
                    batch_time=batch_time, loss=losses,
                    top1=top1, top5=top5))
 
