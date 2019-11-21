@@ -86,7 +86,7 @@ parser.add_argument('--train-list', type=str, default=None)
 parser.add_argument('--train-map', type=str, default=None)
 parser.add_argument('--val-list', type=str, default=None)
 parser.add_argument('--val-map', type=str, default=None)
-parser.add_argument('--validate-start-epoch', type=int, default=-1, help='skip validation until a certain epoch')
+parser.add_argument('--validate-start-epoch', type=int, default=0, help='skip validation until a certain epoch')
 parser.add_argument('--nag', action='store_true', help='use nesterov momentum')
 parser.add_argument('-x', '--feature-extract', dest='feature_extract', action='store_true')
 parser.add_argument('--cos-lr', action='store_true')
@@ -250,6 +250,9 @@ def main():
         validate(val_loader, model, criterion)
         return
 
+    if args.validate_start_epoch < 0:
+        args.validate_start_epoch = args.validate_start_epoch + args.epochs
+
     total_time = AverageMeter()
     for epoch in range(args.start_epoch, args.epochs):
         # train for one epoch
@@ -259,10 +262,10 @@ def main():
         if args.prof:
             break
         # evaluate on validation set
-        if epoch > args.validate_start_epoch:
+        if epoch >= args.validate_start_epoch:
             [prec1, prec5] = validate(val_loader, model, criterion)
         else:
-            prec1 = 0    
+            prec1 = 0
 
         # remember best prec@1 and save checkpoint
         if args.local_rank == 0:
@@ -437,12 +440,12 @@ def feature_extraction(loader, model):
     batch_feat_list = []
     for i, data in enumerate(loader):
         input = data[0]["data"]
-        # target = data[0]["label"].squeeze().cuda().long()
-        loader_len = int(math.ceil(loader._size / args.batch_size))
+        target = data[0]["label"].squeeze().cuda().long()
+        loader_len = int(math.ceil(loader._size / args.val_batch_size))
 
-        # target = target.cuda(non_blocking=True)
+        target = target.cuda(non_blocking=True)
         input_var = Variable(input)
-        # target_var = Variable(target)
+        target_var = Variable(target)
 
         # compute output
         with torch.no_grad():
@@ -459,8 +462,8 @@ def feature_extraction(loader, model):
                   'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                   'Speed {2:.3f} ({3:.3f})\t'.format(
                    i, loader_len,
-                   args.total_batch_size / batch_time.val,
-                   args.total_batch_size / batch_time.avg,
+                   args.val_batch_size * args.world_size / batch_time.val,
+                   args.val_batch_size * args.world_size / batch_time.avg,
                    batch_time=batch_time))
     
     feat_list = torch.stack(batch_feat_list)
