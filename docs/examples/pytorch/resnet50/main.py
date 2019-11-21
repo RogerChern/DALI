@@ -268,7 +268,7 @@ def main():
             prec1 = 0
 
         # remember best prec@1 and save checkpoint
-        if args.local_rank == 0:
+        if args.local_rank == 0 and epoch >= args.validate_start_epoch:
             is_best = prec1 > best_prec1
             best_prec1 = max(prec1, best_prec1)
             save_checkpoint({
@@ -285,7 +285,8 @@ def main():
 
         # reset DALI iterators
         train_loader.reset()
-        val_loader.reset()
+        if epoch >= args.validate_start_epoch:
+            val_loader.reset()
 
 def train(train_loader, model, criterion, optimizer, epoch):
     batch_time = AverageMeter()
