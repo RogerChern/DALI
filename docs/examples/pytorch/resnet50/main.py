@@ -113,10 +113,6 @@ if args.test:
 if not len(args.data):
     raise Exception("error: too few arguments")
 
-args.distributed = False
-if 'WORLD_SIZE' in os.environ:
-    args.distributed = int(os.environ['WORLD_SIZE']) > 1
-
 if args.fp16:
     from apex.fp16_utils import (network_to_half, FP16_Optimizer)
 
@@ -130,15 +126,10 @@ if args.fp16 or args.distributed:
 def main():
     global best_prec1, args
 
-    args.gpu = 0
-    args.world_size = 1
-
-    if args.distributed:
-        args.gpu = args.local_rank % torch.cuda.device_count()
-        torch.cuda.set_device(args.gpu)
-        torch.distributed.init_process_group(backend='nccl',
-                                             init_method='env://')
-        args.world_size = torch.distributed.get_world_size()
+    args.gpu = args.local_rank % torch.cuda.device_count()
+    torch.cuda.set_device(args.gpu)
+    torch.distributed.init_process_group(backend='nccl', init_method='env://')
+    args.world_size = torch.distributed.get_world_size()
 
     args.total_batch_size = args.world_size * args.batch_size
 
@@ -243,7 +234,7 @@ def main():
     val_loader = DALIClassificationIterator(pipe, size=pipe.epoch_size())
 
     if args.feature_extract:
-        feature_extraction(val_loader, model)
+        feature_extraction(val_loader, model, val_list_file)
         return
 
     if args.evaluate:
@@ -431,8 +422,18 @@ def validate(val_loader, model, criterion):
     return [top1.avg, top5.avg]
 
 
-def feature_extraction(loader, model):
+def feature_extraction(loader, model, list_file):
     batch_time = AverageMeter()
+
+    label_list = []
+    with open(list_file) as fin:
+        for line in fin:
+            _, label = line.strip().split()
+            label_list.append(int(label))
+    shard_size = len(label_list) // args.world_size
+    shard_start = args.local_rank * shard_size
+    shard_end = (args.local_rank + 1) * shard_size if args.local_rank != args.world_size -1 else len(label_list)
+    label_list = label_list[shard_start:shard_end]
 
     # switch to evaluate mode
     model.eval()
@@ -443,6 +444,10 @@ def feature_extraction(loader, model):
         input = data[0]["data"]
         target = data[0]["label"].squeeze().cuda().long()
         loader_len = int(math.ceil(loader._size / args.val_batch_size))
+
+        # enforce the order of input images
+        for list_label, loader_label in zip(label_list[i*args.val_batch_size:(i+1)*args.val_batch_size], data[0]["label"].squeeze()):
+            assert list_label == loader_label
 
         target = target.cuda(non_blocking=True)
         input_var = Variable(input)
@@ -467,7 +472,7 @@ def feature_extraction(loader, model):
                    args.val_batch_size * args.world_size / batch_time.avg,
                    batch_time=batch_time))
     
-    feat_list = torch.stack(batch_feat_list)
+    feat_list = torch.cat(batch_feat_list)
     pa.serialize_to(feat_list.cpu().numpy(), open('image_features_part%d' % args.local_rank, 'wb'))
 
 
