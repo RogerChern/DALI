@@ -246,6 +246,9 @@ def main():
     if args.validate_start_epoch < 0:
         args.validate_start_epoch = args.validate_start_epoch + args.epochs
 
+    # print args
+    print_once(args)
+
     total_time = AverageMeter()
     for epoch in range(args.start_epoch, args.epochs):
         # train for one epoch
@@ -448,8 +451,7 @@ def feature_extraction(loader, model, list_file):
         loader_len = int(math.ceil(loader._size / args.val_batch_size))
 
         # enforce the order of input images
-        for list_label, loader_label in zip(label_list[i*args.val_batch_size:(i+1)*args.val_batch_size], data[0]["label"].squeeze()):
-            assert list_label == loader_label
+        assert label_list[i] == data[0]["label"].squeeze()
 
         target = target.cuda(non_blocking=True)
         input_var = Variable(input)
