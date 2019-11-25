@@ -1,3 +1,4 @@
+import os
 import random
 import torch
 import tqdm
@@ -43,14 +44,18 @@ def matrix_dist_test_suite():
     print("matrix_dist is tested!")
 
 
-def kcenter_greedy(feat_mat, n_centers):
-    selection = set()
+def kcenter_greedy(feat_mat, n_centers, seeds):
+    assert isinstance(feat_mat, torch.Tensor) and feat_mat.dim() == 2
+    if isinstance(seeds, int):
+        seeds = [seeds]
+    assert isinstance(seeds, list)
+    
+    selection = set(seeds)
 
-    min_dist_mat = matrix_dist(feat_mat, feat_mat[0])
-    min_dist_mat[0] = -1
-    selection.add(0)
+    min_dist_mat, _ = matrix_dist(feat_mat, feat_mat[seeds, :]).min(axis=1, keepdim=True)
+    min_dist_mat[seeds, :] = -1
 
-    for i in tqdm.tqdm(range(n_centers - 1)):
+    for i in tqdm.tqdm(range(n_centers - len(seeds))):
         argmax_min_dist_mat = min_dist_mat.argmax().squeeze().cpu().numpy().item()
         selection.add(argmax_min_dist_mat)
         min_dist_mat[argmax_min_dist_mat] = -1
@@ -60,10 +65,70 @@ def kcenter_greedy(feat_mat, n_centers):
 
     return selection
 
-def test_kcenter_greedy(n, k):
-    print(kcenter_greedy(torch.randn(n, 2048).cuda(), k))
 
+def speed_test_kcenter_greedy(n, k):
+    print(kcenter_greedy(torch.randn(n, 2048).cuda(), k, [0]))
+
+
+def test_kcenter_greedy():
+    xs, ys = torch.meshgrid(torch.arange(10), torch.arange(10))
+    points = torch.cat([xs.reshape(-1, 1), ys.reshape(-1, 1)], dim=1)  # 100 x 2
+    points = points[torch.randperm(100)]
+    selections = kcenter_greedy(points.float(), 10, [0, 2])
+    canvas = torch.zeros(size=(10, 10))
+    for point in points[list(selections)]:
+        canvas[point[0], point[1]] = 1
+    print(canvas)
+
+
+def sample_with_kcenter_greedy():
+    import pyarrow as pa
+    with open("exps/r50_GAP_1.3M.pa", "rb") as fin:
+        features = pa.deserialize_from(fin, None)
+        features = torch.from_numpy(features).float().cuda()
+        selections = kcenter_greedy(features, 64100, [0])
+    with open(os.path.expanduser("~/datasets/imagenet/train.lst.full")) as fin:
+        file_list = []
+        control_file_list = []
+        for i, line in enumerate(fin):
+            if i in selections:
+                file_list.append(line)
+            if i + 1 in selections:
+                control_file_list.append(line)
+    with open(os.path.expanduser("~/datasets/imagenet/train.lst.r50_oracle_1"), "w") as fout:
+        for line in file_list:
+            fout.write(line)
+    with open(os.path.expanduser("~/datasets/imagenet/train.lst.r50_oracle_1_control"), "w") as fout:
+        for line in control_file_list:
+            fout.write(line)
+
+
+def sample_with_kcenter_greedy_v2():
+    import json
+    import pyarrow as pa
+    with open(os.path.expanduser("~/datasets/imagenet/first.1000.id.json")) as fin:
+        seeds = json.load(fin)
+    with open("exps/r50_GAP_1.3M.pa", "rb") as fin:
+        features = pa.deserialize_from(fin, None)
+        features = torch.from_numpy(features).float().cuda()
+        selections = kcenter_greedy(features, 64100, seeds)
+    with open(os.path.expanduser("~/datasets/imagenet/train.lst.full")) as fin:
+        file_list = []
+        control_file_list = []
+        for i, line in enumerate(fin):
+            if i in selections:
+                file_list.append(line)
+            if i + 1 in selections:
+                control_file_list.append(line)
+    with open(os.path.expanduser("~/datasets/imagenet/train.lst.r50_oracle_2"), "w") as fout:
+        for line in file_list:
+            fout.write(line)
+    with open(os.path.expanduser("~/datasets/imagenet/train.lst.r50_oracle_2_control"), "w") as fout:
+        for line in control_file_list:
+            fout.write(line)
 
 if __name__ == "__main__":
     # matrix_dist_test_suite()
-    test_kcenter_greedy(1280000, 60000)
+    # speed_test_kcenter_greedy(1280000, 60000)
+    # test_kcenter_greedy()
+    sample_with_kcenter_greedy()
