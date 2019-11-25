@@ -116,6 +116,8 @@ if not len(args.data):
 if args.fp16:
     from apex.fp16_utils import (network_to_half, FP16_Optimizer)
 
+args.distributed = True
+
 # make apex optional
 if args.fp16 or args.distributed:
     try:
