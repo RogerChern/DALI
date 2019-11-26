@@ -53,14 +53,14 @@ def kcenter_greedy(feat_mat, n_centers, seeds):
     selection = set(seeds)
 
     min_dist_mat, _ = matrix_dist(feat_mat, feat_mat[seeds, :]).min(axis=1, keepdim=True)
-    min_dist_mat[seeds, :] = -1
+    min_dist_mat[seeds, :] = -1e15
 
     for i in tqdm.tqdm(range(n_centers - len(seeds))):
         argmax_min_dist_mat = min_dist_mat.argmax().squeeze().cpu().numpy().item()
         selection.add(argmax_min_dist_mat)
-        min_dist_mat[argmax_min_dist_mat] = -1
+        min_dist_mat[argmax_min_dist_mat] = -1e15
         increment_min_dist_mat = matrix_dist(feat_mat, feat_mat[argmax_min_dist_mat])
-        increment_min_dist_mat[argmax_min_dist_mat] = -1
+        increment_min_dist_mat[argmax_min_dist_mat] = -1e15
         min_dist_mat = torch.min(min_dist_mat, increment_min_dist_mat)
 
     return selection
@@ -81,9 +81,9 @@ def test_kcenter_greedy():
     print(canvas)
 
 
-def sample_with_kcenter_greedy():
+def sample_with_kcenter_greedy(feature_file):
     import pyarrow as pa
-    with open("exps/r50_GAP_1.3M.pa", "rb") as fin:
+    with open(feature_file, "rb") as fin:
         features = pa.deserialize_from(fin, None)
         features = torch.from_numpy(features).float().cuda()
         selections = kcenter_greedy(features, 64100, [0])
@@ -103,12 +103,12 @@ def sample_with_kcenter_greedy():
             fout.write(line)
 
 
-def sample_with_kcenter_greedy_v2():
+def sample_with_kcenter_greedy_v2(feature_file):
     import json
     import pyarrow as pa
     with open(os.path.expanduser("~/datasets/imagenet/first.1000.id.json")) as fin:
         seeds = json.load(fin)
-    with open("exps/r50_GAP_1.3M.pa", "rb") as fin:
+    with open(feature_file, "rb") as fin:
         features = pa.deserialize_from(fin, None)
         features = torch.from_numpy(features).float().cuda()
         selections = kcenter_greedy(features, 64100, seeds)
@@ -131,4 +131,4 @@ if __name__ == "__main__":
     # matrix_dist_test_suite()
     # speed_test_kcenter_greedy(1280000, 60000)
     # test_kcenter_greedy()
-    sample_with_kcenter_greedy()
+    sample_with_kcenter_greedy("exps/r50_GAP_1.3M.pa")
